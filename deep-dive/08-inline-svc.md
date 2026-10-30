@@ -2,7 +2,7 @@
 
 Dopamine (roothide, 3.0.12) живёт в чужих процессах: `systemhook.dylib` подгружается через `DYLD_INSERT_LIBRARIES`, а `launchdhook.dylib` слит в `/sbin/launchd` через `machomerger`. Эти библиотеки сами хукают критичные символы — `posix_spawn`, `execve`, `ptrace`, `csops`, `_kernelrpc_mach_vm_protect_trap`, `wait4` — и одновременно обязаны их вызывать для собственных нужд. Любая попытка идти через `libSystem` закончилась бы бесконечной рекурсией через собственный хук (или в лучшем случае через конкурирующий хук чужого твика, который сядет поверх нашего). Решение, повторяющее приём, традиционный для Substrate/Substitute и дошедший до Dopamine, — обойти пользовательскую обёртку и выдать команду ядру самостоятельно, инструкцией `svc #0x80`. Эта глава разбирает все три кластера таких «inline» примитивов в Dopamine — `BaseBin/libjailbreak/src/inline_svc.{c,S,h}`, `BaseBin/systemhook/src/common/inline.{S,h}` и `BaseBin/forkfix/src/syscall.S`, — показывает ABI системных вызовов на ARM64 Darwin, разбирает каждую строку макроса `DEF_SYSCALL`, и прослеживает, как `__posix_spawn_inline`, `ptrace_inline`, `waitpid_inline` и `getpid_inline` используются по месту для разрыва петли «хук вызывает сам себя».
 
-Все рассуждения в этой главе относятся к iOS 26.0 и 26.0.1 на A12/A13 (PPL) — единственной среде, поддерживаемой Dopamine 3.0.12 на этой стадии (`Application/Dopamine/Jailbreak/DOEnvironmentManager.m:254`). Код inline-syscall примитивов полностью общий для arm64 и arm64e, различается только обрамление (PAC-пролог/эпилог `pacibsp/retab`), поэтому отдельных ветвей для 26.0 vs 26.0.1 в этих файлах нет (`различия не выявлены`).
+Все рассуждения в этой главе относятся к iOS 26.0 и 26.0.1 на A12/A13 (PPL) — единственной среде, поддерживаемой Dopamine 3.0.12 на этой стадии (`Application/Dopamine/Jailbreak/DOEnvironmentManager.m:254`). Код inline-syscall примитивов полностью общий для arm64 и arm64e, различается только обрамление (PAC-пролог/эпилог `pacibsp/retab`), поэтому отдельных ветвей для 26.0 vs 26.0.1 в этих файлах нет — `различия не выявлены`.
 
 ## 1. Зачем вообще inline SVC
 
@@ -25,6 +25,31 @@ wpr = waitpid_inline(gHookdPid, &status, WNOHANG);
 Комментарий автора буквальный: если какой-то твик хукает `wait4`, `waitpid`, `__waitpid` — launchd (внутри которого крутится `launchdhook`) не должен от этого падать. Чистый `svc` обходит всё, что может натворить `TweakLoader`.
 
 Третий сценарий — ранний старт. `BaseBin/forkfix/src/syscall.S` снабжает `forkfix.dylib` своим набором `ffsys_*`: `fork`, `vm_protect`, `getpid`, `pid_suspend`, `read`, `write`, `close`. Эта библиотека грузится в arm64e-процессе после модификации страниц (`BaseBin/systemhook/src/main.c:484-486`) и чинит `fork(2)` под PAC. На момент её инициализации символьная таблица `libSystem` ещё может быть не прошита dyld-фиксами по месту (fork-safe), а `_current_pid` надо сбросить в ноль сразу после настоящего `fork` — поэтому `ffsys_fork` пишет туда напрямую (строки 15-19).
+
+### 1.1 Иерархия «обёрток» и место inline-syscall в ней
+
+Чтобы увидеть смысл inline-варианта, полезно разложить все слои, через которые проходит обычный вызов `posix_spawn` в пользовательском процессе:
+
+1. **Пользовательский код** — `posix_spawn(&pid, path, &actions, &attr, argv, envp)`.
+2. **Публичный wrapper libSystem** — функция `posix_spawn` в `libsystem_kernel.dylib`. Делает `arg desc`-упаковку, вызывает `__posix_spawn`.
+3. **Private wrapper** — `__posix_spawn` в той же библиотеке: `mov x16, #0xF4; svc #0x80; b.cs _cerror; ret`.
+4. **Ядро** — вектор syscall, `unix_syscall64`, затем `posix_spawn()` ядра XNU.
+
+`systemhook` ставит хук на уровень (2) и (3). Inline-syscall примитив `__posix_spawn_inline` подменяет собой уровень (3): это ровно та же тройка инструкций, что и `__posix_spawn` в libSystem, только лежащая в нашем бинарнике. Для ядра — неразличимо. Для хуков на уровнях (2) и (3) — полностью невидимо, потому что это не вызов именованного символа, а jump на локальный ярлык внутри `systemhook.dylib`.
+
+Эта «честная замена уровня» объясняет и выбор `_cerror_nocancel` для `execve`: именно эту пару использует настоящий `__execve` в libSystem (для его роли «no cancellation point до момента трапа»). Полная семантическая эквивалентность важна: любые побочные эффекты (установка `errno`, обработка cancellation) должны совпадать с тем, что ожидает код после возврата.
+
+### 1.2 Что видит ядро на `svc #0x80`
+
+Со стороны ARM EL1 инструкция `svc` вызывает «synchronous exception from a lower EL». Процессор переходит в EL1 через вектор `VBAR_EL1 + 0x400` (synchronous from AArch64 Lower EL). XNU-овский обработчик (`arm64/sleh.c` / `arm_exceptions.c` в оригинальном XNU — `требует проверки по версии XNU для iOS 26`) декодирует immediate из `ESR_EL1.ISS` и в зависимости от значения в `x16` раздваивается:
+
+- `x16 > 0` → `unix_syscall64` в `bsd/dev/arm/systemcalls.c`.
+- `x16 < 0` → `mach_syscall` в `osfmk/kern/syscall_sw.c` (по индексу `|x16|` в `mach_trap_table`).
+- `x16 == 0` → `_syscall(2)` — универсальный «indirect» BSD-syscall, который берёт настоящий номер из `x0`, а аргументы из `x1..x7`. Это тот самый путь, который использует libc-овский `syscall(3)` (см. `BaseBin/systemhook/src/main.c:165` — `csops_hook` зовёт `syscall(SYS_csops, ...)`).
+
+Для inline-примитивов Dopamine важно только первое правило: все `DEF_SYSCALL(..., N)` в проекте используют положительные `N`, значит, всегда идут в `unix_syscall64`. Mach-trap-вариант (`DEF_MACHTRAP` в `roothider_inline.x:56-63`, `ffsys_vm_protect` в `forkfix/syscall.S:37`) оставляет в `x16` отрицательное значение, что заставит ядро отправить вызов в `mach_syscall`.
+
+Для разработчика это значит: ошибиться знаком в `x16` — не просто «вызов не тот», это **разные ядерные пути** с разным ABI возвращаемого значения. BSD-syscall реализует «carry = ошибка, x0 = errno»; Mach-trap просто возвращает `kern_return_t` в `x0` без флагов, и `0 = KERN_SUCCESS`.
 
 ## 2. ARM64 Darwin syscall ABI
 
@@ -55,7 +80,7 @@ Darwin использует отдельное пространство для �
 #define SYS_necp_session_action 0x20B
 ```
 
-Эти константы перекочёвывают в `inline.S` в десятичной/шестнадцатеричной форме (`0x1a`, `0x3b`, `0xf4`), а также в `inline_svc.S` (`#7` для `wait4`, `#20` для `getpid`). Проверить корректность каждого номера можно по дизассемблу `libsystem_kernel.dylib` с устройства — рекомендую `otool -tV /System/.../libsystem_kernel.dylib | grep -B1 -A2 'svc #0x80'`, но на самом устройстве; требует проверки на устройстве.
+Эти константы перекочёвывают в `inline.S` в десятичной/шестнадцатеричной форме (`0x1a`, `0x3b`, `0xf4`), а также в `inline_svc.S` (`#7` для `wait4`, `#20` для `getpid`). Проверить корректность каждого номера можно по дизассемблу `libsystem_kernel.dylib` с устройства — рекомендую `otool -tV /System/.../libsystem_kernel.dylib | grep -B1 -A2 'svc #0x80'`, но на самом устройстве; `требует проверки на устройстве`.
 
 Схема потока одного inline-вызова:
 
@@ -73,6 +98,34 @@ flowchart LR
 ```
 
 Обратите внимание, что в версии из `inline_svc.S` ветка ошибки устроена иначе: нет `cerror`, вместо него `cmp x16, #4` и `beq _wait4_inline` — автоматический повтор при `EINTR`. Это ещё один жест защиты от «постороннего хука»: если `wait4` прервался сигналом, мы не хотим давать внешнему коду второй шанс.
+
+### 2.1 Carry и `cs`/`cc`: мелочь, которая всё меняет
+
+Карри (`C`) выставляется ядром **через симуляцию инструкции `cmp`** на возврате — проще говоря, ядро пишет флаги в `SPSR_EL1`, которые уходят в `CPSR` при `eret`. Пользовательский код сразу после `svc` видит `C=1` для ошибки.
+
+ARM-ассемблер даёт нам две мнемонические пары:
+
+- `b.cs` (`carry set`) == `b.hs` (unsigned higher-or-same).
+- `b.cc` (`carry clear`) == `b.lo` (unsigned lower).
+
+Это одно и то же кодирование. В Dopamine встречаются обе: `inline_svc.S` использует `bcc` (`b.cc`), `systemhook/common/inline.S` — тоже `b.cc`, `forkfix/syscall.S:14` — `b.cs`. Семантика та же. Важно не перепутать направление: `b.cc X` прыгает **на X**, когда ошибки **нет** (успех); `b.cs X` — наоборот.
+
+### 2.2 Что считается «cancellation point»
+
+Отдельное замечание про разделение `_cerror` и `_cerror_nocancel`. Darwin держит две версии error-trampoline в libSystem:
+
+- `_cerror` — проверяет pthread cancel state, и если тред маркирован отменённым — завершает его через `_pthread_exit`.
+- `_cerror_nocancel` — только записывает `errno` и возвращает `-1`.
+
+В `BaseBin/systemhook/src/common/inline.S:22-24` выбор между ними сделан руками:
+
+| Syscall | err-функция | Почему |
+| --- | --- | --- |
+| `ptrace (0x1a)` | `_cerror` | обычная cancellation-aware обёртка |
+| `__execve (0x3b)` | `_cerror_nocancel` | execve в libc всегда through `__execve_nocancel`-путь |
+| `__posix_spawn (0xf4)` | `_cerror` | обычная cancellation-aware обёртка |
+
+Эта классификация **копирует поведение libSystem** — не нужно спорить с ядром и libpthread о том, где нас могли бы «обрезать». Если бы мы ошибочно поставили `_cerror_nocancel` на `posix_spawn`, то unit test на cancellation внутри задачи мог бы заклинить тред, вечно ожидающий возврата из `posix_spawn`-рутины.
 
 ## 3. Семейство `libjailbreak/src/inline_svc.*`
 
@@ -183,6 +236,12 @@ pid_t getpid_inline(void)
 Единственная точка потребления `getpid_inline` в проекте — `BaseBin/libjailbreak/src/hookd.c:89`, где мы собираем Mach-сообщение для `hookd` и обязаны вставить туда PID клиента. Все остальные PID-зависимые пути в `libjailbreak` ходят через обычный `getpid()`.
 
 Единственный потребитель `waitpid_inline` — `BaseBin/launchdhook/src/hookd_provider.c:57`, где launchd проверяет жив ли дочерний `hookd` до того, как отослать ему очередной `hookd_mach_msg`. Чистый `svc` защищает тут от двух сценариев: (1) конкурирующий tweak внутри launchd (крайне редкое, но технически возможное дело), (2) наше же вмешательство в `wait4` — вдруг через год кто-нибудь поставит там хук.
+
+### 3.4 Почему именно `wait4`, а не `waitpid`-syscall
+
+На Darwin нет отдельного syscall-номера для `waitpid`. В таблице `syscalls.master` присутствуют только `wait4 (#7)` и `wait4_nocancel (#452)`. `waitpid(3)` в libc является чисто пользовательской надстройкой, которая зовёт `wait4(pid, status, flags, NULL)`. Dopamine повторяет это один в один в `inline_svc.c`: сначала валидация флагов, потом forward на `wait4_inline`.
+
+Если понадобится «нецелевое» ожидание (например, `waitid(2)`), то это уже отдельный syscall №173 с иной сигнатурой — простая замена номера в макросе не сработает.
 
 ## 4. Семейство `systemhook/src/common/inline.*`
 
@@ -303,7 +362,37 @@ int ret = __execve_inline(path, argv, envc);
 
 Та же мотивация: мы в теле хука `execve`, нам нужно позвать «настоящий» execve.
 
-**Что с `csops`?** Исходники показывают: `csops_hook` (`BaseBin/systemhook/src/main.c:163-178`) вызывает `syscall(SYS_csops, pid, ops, useraddr, usersize)` — через `libSystem`-ную обёртку `syscall(2)`, не через inline-syscall. Это сработает «мимо собственного хука» ровно потому, что `litehook_hook_function(csops, csops_hook)` (`main.c:513`) правит именно символ `csops`, а не универсальный `syscall()`. Технически — похожая механика (трап №0xA9 ядру), но код проекта в этом месте не использует отдельную `csops_inline`-функцию, и формулировка задания про «csops вызывается мимо своих же хуков через inline SVC» — не подтверждена исходниками: inline-syscall для csops в проекте не нашёл по grep (`BaseBin/systemhook/src/common/inline.S:22-24` перечисляет только ptrace/execve/posix_spawn). Если понадобится обойти чужой хук именно на `syscall()`, схему легко скопировать с `DEF_SYSCALL` и добавить `DEF_SYSCALL _csops_inline, 0xA9, _cerror` — требует проверки на устройстве, работает ли это без дополнительной защиты sandbox.
+**Что с `csops`?** Исходники показывают: `csops_hook` (`BaseBin/systemhook/src/main.c:163-178`) вызывает `syscall(SYS_csops, pid, ops, useraddr, usersize)` — через `libSystem`-ную обёртку `syscall(2)`, не через inline-syscall. Это сработает «мимо собственного хука» ровно потому, что `litehook_hook_function(csops, csops_hook)` (`main.c:513`) правит именно символ `csops`, а не универсальный `syscall()`. Технически — похожая механика (трап №0xA9 ядру), но код проекта в этом месте не использует отдельную `csops_inline`-функцию, и формулировка задания про «csops вызывается мимо своих же хуков через inline SVC» — не подтверждена исходниками: inline-syscall для csops в проекте не нашёл по grep (`BaseBin/systemhook/src/common/inline.S:22-24` перечисляет только ptrace/execve/posix_spawn). Если понадобится обойти чужой хук именно на `syscall()`, схему легко скопировать с `DEF_SYSCALL` и добавить `DEF_SYSCALL _csops_inline, 0xA9, _cerror` — `требует проверки на устройстве`, работает ли это без дополнительной защиты sandbox.
+
+### 4.4 Что `csops_hook` на самом деле делает
+
+Небольшая справка, потому что это самый частый источник недопонимания:
+
+```c
+int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
+{
+    int rv = syscall(SYS_csops, pid, ops, useraddr, usersize);   // (1)
+    if (rv != 0) return rv;
+    if (ops == CS_OPS_STATUS) {
+        if (useraddr && usersize == sizeof(uint32_t)) {
+            uint32_t* csflag = (uint32_t *)useraddr;
+            *csflag |= CS_VALID;                                  // (2)
+            *csflag &= ~CS_DEBUGGED;
+            if (pid == getpid() && gFullyDebugged) {
+                *csflag |= CS_DEBUGGED;
+            }
+        }
+    }
+    return rv;
+}
+```
+
+- (1) — вызов настоящего syscall через `_syscall(2)` (универсальная indirect-обёртка). Это идёт через x16=0, но *не* через хукнутый символ `csops`, поэтому рекурсии нет.
+- (2) — патч csflags после возврата: добавить `CS_VALID`, снять `CS_DEBUGGED` (кроме случая, когда это наш собственный процесс с явным debug-режимом).
+
+Хук регистрируется в `main.c:513` только для arm64, не arm64e: на arm64e модификация страниц не выставляет флаг `CS_DEBUGGED`, поэтому и чинить ничего не надо.
+
+Урок для патч-авторов: если вы хотите обойти *чужой* хук на `csops`, индирект-syscall вам поможет; если хотите обойти чужой хук на `syscall(2)` сам по себе — нужен настоящий inline-syscall с макросом `DEF_SYSCALL`.
 
 ## 5. Семейство `forkfix/src/syscall.S`
 
@@ -351,6 +440,18 @@ int ret = __execve_inline(path, argv, envc);
 
 Все шесть обёрток **не делают EINTR-retry и не трогают `errno`** — forkfix живёт в достаточно узком окне, где libc-состояние может быть неполным; делать `bl _cerror` слишком опасно. Единственное исключение — ветка ошибки в `ffsys_fork`, которая всё-таки падает в `_cerror` (строка 23): это нужно, чтобы родитель получил ожидаемый `errno` на обычной ветке `fork()`-failure.
 
+### 5.1 ABI родителя и ребёнка в `fork(2)`
+
+Небольшая деталь, которая легко упускается при чтении `ffsys_fork`:
+
+- В родителе ядро возвращает `x0 = pid ребёнка`, `x1 = 0`.
+- В ребёнке — `x0 = pid родителя`, `x1 = 1`.
+- При ошибке — `C=1`, `x0 = errno`.
+
+Строка `cbz x1, _ffsys_fork_end` ровно это и использует: «если `x1` ноль — мы родитель, возвращаем как есть, пропускаем reset `_current_pid`». В противном случае (`x1 == 1`) мы в ребёнке: записываем `w0 = 0` в `x0` (так требует libc-овский API `fork()`, который гарантирует родителю `pid > 0`, ребёнку `0`) и зануляем общий кэш.
+
+Это буквально та же логика, что в `__fork` в libSystem — но с добавленной записью в `_current_pid`.
+
 ## 6. Макрос `DEF_SYSCALL` из `roothider_inline.x`
 
 Это уже «четвёртое» место, где живёт тот же приём — но в особой форме. `BaseBin/systemhook/src/roothider_inline.x` компилируется в самостоятельный объектник `roothider_inline.o`, который должен содержать **ноль неразрешённых символов** (см. `BaseBin/systemhook/Makefile:16-23` — там прямо `nm -u -j` на нём идёт, и FAIL при любом остатке). Для этого вместо вызовов libSystem у каждого примитива — свой inline-syscall. Макрос (`roothider_inline.x:39-54`):
@@ -375,6 +476,8 @@ int ret = __execve_inline(path, argv, envc);
 ```
 
 Семантика идентична `libjailbreak/inline_svc.S` — EINTR-retry, нет `cerror`. Разница только в оформлении: это `.x`-файл (на самом деле C с inline-asm), и каждому syscall-wrapper'у даётся переименование через `__asm__("_roothider_syscall_" #name)`, чтобы линковщик не конфликтовал с настоящим символом `name` в других объектниках. Пример единственного использования — `DEF_SYSCALL(__sandbox_ms, 381);` (`roothider_inline.x:111`).
+
+Для чего нужен **именно `__sandbox_ms`?** Это внутренний syscall `sandbox_ms` (многофункциональный MACF-гейт), используемый sandbox-API. Dyldhook-слой roothider вызывает его напрямую, в обход хуков sandbox.framework, чтобы потребить sandbox-extension до того, как sandbox сам успел проинициализироваться. Это именно тот редкий случай, когда «ранний старт» и «обход хуков» совпадают.
 
 Таким образом в проекте фактически **четыре параллельных реализации одного и того же приёма** (считая `dyldhook/src/main.S:5` — тот же макрос для dyld-овских трамплин):
 
@@ -407,6 +510,34 @@ int ret = __execve_inline(path, argv, envc);
 
 Нельзя полагаться на номера из публичного `sys/syscall.h` SDK в отрыве от конкретной версии iOS — Darwin иногда добавляет syscall в середину таблицы, из-за чего индексы смещаются. По подтверждению из `BaseBin/systemhook/src/common/private.h:7-15` в этом релизе Dopamine номера для `ptrace/execve/posix_spawn/csops/necp_*` зафиксированы вручную.
 
+### 7.1 Отладка inline-syscall через LLDB
+
+Полезный приём: при подключённом debugserver к процессу, который загрузил `systemhook.dylib`, можно поставить break перед `svc`:
+
+```
+(lldb) image lookup -n ___posix_spawn_inline
+(lldb) br s -a <addr+8>        # сразу перед svc #0x80
+(lldb) r
+...
+(lldb) register read x16 x0 x1
+     x16 = 0x00000000000000f4
+      x0 = 0x000000016d1c3f30
+      x1 = 0x0000000000000000
+```
+
+Если `x16` показывает что-то другое, кроме ожидаемого номера, значит либо макрос развернулся с опечаткой, либо кто-то успел перепатчить код до `svc`. Второй вариант — малореалистичный (`.text` маппится R-X), но даёт ценную информацию.
+
+Второй приём: пробежаться по возвращаемому `errno`. Поставить break сразу после `svc` и прочитать `cpsr`:
+
+```
+(lldb) register read cpsr
+     cpsr = 0x60000000       ; биты NZCV = 0b0110 → C=1 → ошибка!
+(lldb) register read x0
+     x0 = 0x0000000000000016 ; = 22 = EINVAL
+```
+
+Это ровно тот путь, по которому `inline_svc.S` придёт в `mov x16, #-1`, и выходной `-1` вернётся в `waitpid_inline`, где C-слой уже ничего не делает с `errno` (там мы его только сами выставляли ранее при валидации).
+
 ## 8. Пример: как бы выглядел новый inline-примитив `read`
 
 Предположим, нужен `read_inline` (который не трогает чужие хуки на `read(2)` в контексте launchd). Пишем в стиле `inline_svc.S`:
@@ -429,10 +560,68 @@ ssize_t read_inline(int fd, void *buf, size_t count);
 Разбор:
 
 - `read` имеет 3 аргумента — укладываются в `x0..x2`, но макрос всё равно спасает `x6..x7` «на всякий случай» (легально: ABI не обязывает их не трогать, но и трогает ядро через `svc` только то, что должно).
-- EINTR-retry здесь уже реалистичен: `read(2)` на tty возвращает `-1 + EINTR` регулярно, и повторное дергание — именно то поведение, которое ожидают клиенты в launchd.
+- EINTR-retry здесь уже реалистичен: `read(2)` на tty возвращает `-1 + EINTR` регулярно, и повторное дёргание — именно то поведение, которое ожидают клиенты в launchd.
 - Если понадобится проверить, что код линкуется в `systemhook`, нужно добавить файл в `BaseBin/systemhook/Makefile:28` в маску `src/*.[cSm]`. Или в соответствующий Makefile конкретного компонента, где он нужен.
 
 Этот пример специально приведён в стиле «клонируем макрос, добавляем две строки» — ровно так разработчик Dopamine добавил `getpid_svc_inline` рядом с `wait4_inline`.
+
+### 8.1 Если понадобилось EINTR-retry, но для возврата `-1 + errno`
+
+Иногда хочется ровно либо «честный `-1 + errno`», либо «автоматический retry». Для первого удобно использовать макрос из `systemhook/common/inline.S`; но он *не* делает retry. Для гибрида — макрос из `inline_svc.S`, но с одной добавкой: после `mov x16, #-1` сохранить `errno`. В C-обёртке:
+
+```c
+#include <errno.h>
+ssize_t safe_read_inline(int fd, void *buf, size_t count)
+{
+    extern ssize_t read_inline(int, void *, size_t);
+    ssize_t r = read_inline(fd, buf, count);
+    if (r == -1) {
+        // Сам читатель ядра уже «не знает» об errno, потому что мы
+        // перехватили его в assembly-cerror-less-варианте. Поэтому — ничего.
+    }
+    return r;
+}
+```
+
+Что не очень удобно. Для случаев, когда и retry, и `errno`, разработчику проще всего скопировать макрос из `systemhook/common/inline.S` и добавить `cmp x16, #4` → `beq <top>` между `b.cc done` и прыжком в `_cerror`.
+
+### 8.2 Как инлайн-примитивы попадают в финальный `.dylib`
+
+Чтобы увидеть, где рождаются символы, посмотрим на `BaseBin/systemhook/Makefile:3`:
+
+```make
+CFLAGS = -I../.include -I./src -I../_external/modules/litehook/src \
+         -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) \
+         -arch arm64 -arch arm64e -miphoneos-version-min=15.0 \
+         -install_name @loader_path/$(TARGET) \
+         -Wno-deprecated-declarations \
+         -D BUILD_STANDALONE=$(BUILD_STANDALONE) -Os -moutline
+```
+
+и target rule (`Makefile:28`):
+
+```make
+$(TARGET): $(wildcard src/*.[cSm] src/common/*.[cSm] \
+                      ../libjailbreak/src/jbclient_*.c \
+                      ../libjailbreak/src/inline_svc.[cS] \
+                      ../libjailbreak/src/hookd.c \
+                      ../_external/modules/litehook/src/*.c)
+    $(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+```
+
+Что здесь интересно для нашей темы:
+
+- Один билд собирает **одновременно arm64 и arm64e**. Все макросы (`__arm64e__`) включают/выключают `pacibsp/retab`-ветки в двух разных «slice» одного fat-mach-o.
+- `inline_svc.[cS]` *явно* перечислен в маске, то есть `wait4_inline` и `getpid_inline` попадают в `systemhook.dylib` даже когда их никто не использует напрямую. Это нужно, потому что `hookd.c` (их прямой клиент) берётся из того же списка и ссылается на `getpid_inline`.
+- `-Os -moutline` вообще не касается ассемблерных файлов — только C. Так что макросы разворачиваются «буква-в-букву» и не подвергаются аутлайнингу (который LLVM мог бы попытаться применить и который бы для syscall-пролога оказался катастрофой: нельзя переходить в outlined-функцию через `bl` между `svc` и `b.cc`, иначе теряется флаг carry).
+
+Такой же анализ для `BaseBin/launchdhook/Makefile` (не привожу целиком — одна `wildcard`-маска) показывает, что `inline_svc.[cS]` там тоже есть; `launchdhook.dylib` может звать `waitpid_inline` потому, что он уже слинкован внутри.
+
+### 8.3 Что происходит с символом `wait4_inline` после линковки
+
+На выходе `ld` символ `_wait4_inline` остаётся **внешним**, видимым другим dylib через `dyld`-таблицу. Если в будущем кто-то (например, патч-разработчик твика) захочет вызвать его из своего кода — достаточно `extern pid_t wait4_inline(...)` и линковки с `-ljailbreak`. Это намеренно: `libjailbreak` даёт публичный API для твиков, которым нужна гарантированная семантика.
+
+С `__posix_spawn_inline` ситуация иная: ассемблер объявляет имя с префиксом `___`, но без `.private_extern`-директивы, то есть символ тоже глобален. Однако в заголовке `inline.h` он объявлен без `extern` — на практике вызов из другого dylib потребует явной линковки `-l systemhook` или `dlsym` по имени `__posix_spawn_inline`. Это чуть менее удобно, но следует природе `systemhook`-а: он работает «только изнутри», и шарить его inline-примитивы с другими модулями не предполагается.
 
 ## 9. Чем inline-syscall **не** является
 
@@ -440,7 +629,8 @@ ssize_t read_inline(int fd, void *buf, size_t count);
 
 - **Не способ обойти Codesign или sandbox.** `svc` всё равно идёт в XNU, который проверяет `CS_VALID`, `platform_binary`, `AMFI`-энфорсменты и так далее. Dopamine уже обходит их в другом месте (см. `deep-dive/06-codesign.md` для разбора `csops`-патчей). Inline-syscall ровно и исключительно о пользовательском пути: он не трогает хуки `MACF`.
 - **Не оптимизация.** Прирост по времени от «пропуска libc-пролога» на macOS/iOS — микроскопический и несущественный против накладных на сам trap. Единственная цель — семантическая изоляция от хуков.
-- **Не универсален для mach-trap`ов.** Для позитивных syscall-номеров `svc #0x80` работает всегда, но Mach-traps требуют отрицательных номеров (`BaseBin/forkfix/src/syscall.S:37` — `ffsys_vm_protect`, `mov x16, #-14`). Писать «тот же DEF_SYSCALL с минусом» нельзя без исправления возвращаемого значения — mach_trap возвращает `kern_return_t`, carry-флаг не выставляет. Для mach-trap нужен отдельный `DEF_MACHTRAP`, как в `roothider_inline.x:56-63`.
+- **Не универсален для mach-trap-ов.** Для позитивных syscall-номеров `svc #0x80` работает всегда, но Mach-traps требуют отрицательных номеров (`BaseBin/forkfix/src/syscall.S:37` — `ffsys_vm_protect`, `mov x16, #-14`). Писать «тот же DEF_SYSCALL с минусом» нельзя без исправления возвращаемого значения — mach_trap возвращает `kern_return_t`, carry-флаг не выставляет. Для mach-trap нужен отдельный `DEF_MACHTRAP`, как в `roothider_inline.x:56-63`.
+- **Не замена MIG-RPC.** Mach-trap — тонкий, быстрый, но ограниченный интерфейс (не умеет сложные типы, out-of-line данные). Для настоящего ресурсоёмкого Mach-канала нужен `mach_msg` + MIG-stub, а не inline-trap.
 
 ## 10. Выводы
 
@@ -449,6 +639,7 @@ ssize_t read_inline(int fd, void *buf, size_t count);
 - Макросы `DEF_SYSCALL` разные по мелочам: libjailbreak-вариант спасает `x0..x7` и ретраит `EINTR`, systemhook-вариант идёт через `_cerror`/`_cerror_nocancel` под защитой `pacibsp`/`retab`. Форма адаптирована под того клиента, которому примитив нужен.
 - ABI, который используют все четыре семейства, един: `x16` — номер syscall (положительный для BSD, отрицательный для mach trap), `x0..x7` — аргументы, `svc #0x80`, флаг carry — признак ошибки, `x0` — результат/код ошибки. Это тот же контракт, что и у libSystem, просто без её обёрток.
 - PID-кэш `_current_pid` — единственная «глобальная переменная», которую все три кластера модифицируют совместно: `getpid_inline` читает, `ffsys_fork` в ребёнке сбрасывает. Это маленькая, но показательная демонстрация того, насколько тесно спроектированы форкфикс и libjailbreak.
+- Для csops Dopamine 3.0.12 **не** использует inline-syscall примитив (`csops_hook` вызывает `syscall(SYS_csops, ...)` через libSystem); обход хуков там работает иначе — через иное имя символа (`syscall` vs `csops`). Это важно понимать, чтобы не искать несуществующих `csops_inline`-функций.
 
 ## 11. Что дальше
 

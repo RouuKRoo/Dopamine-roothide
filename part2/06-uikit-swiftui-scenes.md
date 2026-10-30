@@ -1,6 +1,6 @@
 # Глава II.6. Окна, сцены, UIKit, SwiftUI, ввод и жесты
 
-В этой главе мы разбираем на уровне кода и первичных источников, как в iOS 26.0 и 26.0.1 на устройствах A12/A13 (с подсистемой PPL) организовано представление приложения в графическом слое — от объекта `UIApplication` и сцены (scene) до одной конкретной тач-точки, доехавшей от `backboardd` до вашего `-touchesBegan:withEvent:`. Нас интересуют не формальные определения, а именно те места, где автор твика может — или наоборот не должен — вклиниваться. Это нужно, чтобы: во‑первых, выбирать правильный уровень хука (UIKit‑метод, низкоуровневый event, или `UIGestureRecognizer`); во‑вторых, понимать, почему SwiftUI почти не поддаётся классическому `MSHookMessageEx`; в‑третьих, не поломать систему сцен многозадачности (multi-scene) в приложениях, которые её поддерживают.
+В этой главе мы разбираем на уровне кода и первичных источников, как в iOS 26.0 и 26.0.1 на устройствах A12/A13 (с подсистемой PPL) организовано представление приложения в графическом слое — от объекта `UIApplication` и сцены (scene) до одной конкретной тач‑точки, доехавшей от `backboardd` до вашего `-touchesBegan:withEvent:`. Нас интересуют не формальные определения, а именно те места, где автор твика может — или наоборот не должен — вклиниваться. Это нужно, чтобы: во‑первых, выбирать правильный уровень хука (UIKit‑метод, низкоуровневый event, или `UIGestureRecognizer`); во‑вторых, понимать, почему SwiftUI почти не поддаётся классическому `MSHookMessageEx`; в‑третьих, не поломать систему сцен многозадачности (multi‑scene) в приложениях, которые её поддерживают.
 
 Все утверждения о коде Dopamine проверены по репозиторию и сопровождаются ссылками вида `путь/файл:строка`. Там, где подтверждение невозможно получить из исходников (например, частные символы `UIKitCore` на устройстве с iOS 26), это помечено как «требует проверки на устройстве A13 с iOS 26.0/26.0.1» или «не подтверждено исходниками». Границы поддержки — iOS 26.0 и 26.0.1 для A12/A13 — зафиксированы в `Application/Dopamine/Jailbreak/DOEnvironmentManager.m:254` и в `Info.plist` эксплойтов `Application/Dopamine/Exploits/DarkSword/Info.plist`, `Application/Dopamine/Exploits/ClearSword/Info.plist`.
 
@@ -29,7 +29,7 @@
 </dict>
 ```
 
-Ключевые строки: `UIApplicationSupportsMultipleScenes = false` означает, что Dopamine принципиально однооконное приложение (роль `UIWindowSceneSessionRoleApplication` — одна, без `UIWindowSceneSessionRoleExternalDisplay` или кастомных ролей). Тип делегата — Objective-C класс `DOSceneDelegate`. Это важная деталь: при хуке SpringBoard или другого приложения вы столкнётесь с тем, что некоторые приложения разрешают несколько сцен (например, Safari или Mail на iPad), а некоторые — как Dopamine — нет. Отсюда простое правило при чтении исходников: *не предполагайте, что в приложении ровно одно окно, пока не прочитали его `Info.plist`.*
+Ключевые строки: `UIApplicationSupportsMultipleScenes = false` означает, что Dopamine принципиально однооконное приложение (роль `UIWindowSceneSessionRoleApplication` — одна, без `UIWindowSceneSessionRoleExternalDisplay` или кастомных ролей). Тип делегата — Objective‑C класс `DOSceneDelegate`. Это важная деталь: при хуке SpringBoard или другого приложения вы столкнётесь с тем, что некоторые приложения разрешают несколько сцен (например, Safari или Mail на iPad), а некоторые — как Dopamine — нет. Отсюда простое правило при чтении исходников: *не предполагайте, что в приложении ровно одно окно, пока не прочитали его `Info.plist`.*
 
 Схема владения объектами, которой следует придерживаться:
 
@@ -58,7 +58,21 @@ flowchart LR
 }
 ```
 
-Этот метод вызывается на каждую новую сессию. Для твика это означает две вещи. Во‑первых, если вы хотите вмешаться в создание окна — хучьте `-scene:willConnectToSession:options:` на классе `UIWindowSceneDelegate` конкретного приложения, а не `-application:didFinishLaunchingWithOptions:` на `UIApplication` (последнее вызывается один раз на процесс, тогда как сцен может быть несколько). Во‑вторых, не стоит ломать `-application:configurationForConnectingSceneSession:options:` неизбирательно: вы перебьёте выбор делегата, и приложение запустится либо без UI, либо с «чужим».
+Этот метод вызывается на каждую новую сессию. Для твика это означает две вещи. Во‑первых, если вы хотите вмешаться в создание окна — хучьте `-scene:willConnectToSession:options:` на классе `UIWindowSceneDelegate` конкретного приложения, а не `-application:didFinishLaunchingWithOptions:` на `UIApplication` (последнее вызывается один раз на процесс, тогда как сцен может быть несколько). Во‑вторых, не стоит ломать `-application:configurationForConnectingSceneSession:options:` неизбирательно: вы перебьёте выбор делегата, и приложение запустится либо без UI, либо с «чужим» корнем.
+
+Присоединение сцены в Dopamine выглядит так:
+
+```objc
+// Application/Dopamine/App Delegates/DOSceneDelegate.m:17-22
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
+    UIWindow *window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+    window.rootViewController = [[DONavigationController alloc] init];
+    [window makeKeyAndVisible];
+    self.window = window;
+}
+```
+
+Разбор: `-initWithWindowScene:` — единственный правильный способ создать окно в scene‑based приложении на iOS 13+. Старый конструктор `-initWithFrame:` создаст «висящее» окно, которое ни к одной сцене не привязано, и Render Server его никогда не покажет. Второе — `makeKeyAndVisible` обязательно: без него окно будет создано, но не станет `keyWindow` сцены. Это критично для хука: если вы в твике создаёте дополнительное окно и забыли `makeKeyAndVisible`, оно не будет получать клавиатурный ввод и `UIFirstResponder`‑маршрутизацию.
 
 ### 6.1.1. `UIApplication`, `UIScene`, `UIWindow`: как добраться до key window в приложении с несколькими сценами
 
@@ -87,9 +101,42 @@ for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
 }
 ```
 
-Ключевые строки: `connectedScenes` возвращает `NSSet<UIScene *>`, фильтр по `UISceneActivationStateForegroundActive` отсекает фоновые сцены (их `.windows` могут быть, но ввод туда не идёт), фильтр `[scene isKindOfClass:[UIWindowScene class]]` отсекает всё, что не является окном (на iPhone это нечастая ситуация, а на iPadOS и внешних дисплеях — норма). Именно такой шаблон стоит использовать в твике для получения активного окна под iOS 26: он корректен и для одно‑, и для многосценных приложений.
+Ключевые строки: `connectedScenes` возвращает `NSSet<UIScene *>`, фильтр по `UISceneActivationStateForegroundActive` отсекает фоновые сцены (их `.windows` могут быть, но ввод туда не идёт), фильтр `[scene isKindOfClass:[UIWindowScene class]]` отсекает всё, что не является окном (на iPhone это нечастая ситуация, а на iPadOS и внешних дисплеях — норма). Именно такой шаблон стоит использовать в твике для получения активного окна под iOS 26: он корректен и для одно‑, и для многосценных приложений. Отметим также безопасную последовательность: сначала проверка состояния сцены, только потом её каст — любой `UIScene` может быть не `UIWindowScene`, а прямой каст без `isKindOfClass:` ломается первым.
 
-### 6.1.2. Рендеринг: `CALayer`, `CAAnimation`, QuartzCore
+Отдельно подчеркнём механизм relaunch — это редкий, но наглядный пример того, как сцену можно «перезагрузить», не создавая новой сессии:
+
+```objc
+// Application/Dopamine/App Delegates/DOSceneDelegate.m:24-41 (сокращённо)
++ (void)relaunch
+{
+    UIWindowScene *windowScene = (UIWindowScene *)[[[UIApplication sharedApplication] connectedScenes] anyObject];
+    DOSceneDelegate *instance = (DOSceneDelegate *)windowScene.delegate;
+    [UIView animateWithDuration:0.3 animations:^{ instance.window.alpha = 0; } completion:^(BOOL finished) {
+        UIWindow *window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)instance.window.windowScene];
+        window.rootViewController = [[DONavigationController alloc] init];
+        [window makeKeyAndVisible];
+        instance.window = window;
+        [UIView animateWithDuration:0.3 animations:^{ instance.window.alpha = 1; }];
+    }];
+}
+```
+
+Ключевое: создаётся *новое* `UIWindow` на той же `UIWindowScene` — это «мягкий» перезапуск UI без пересоздания сцены. Dopamine использует этот трюк, чтобы корректно применить смену языка/темы. Для твиков тот же приём полезен, если нужно принудительно обновить всё дерево контроллеров.
+
+### 6.1.2. Запуск: `UIApplicationMain`, `UIResponder`‑цепочка и место твика
+
+Перед тем как перейти к рендерингу, зафиксируем, в какой момент процесс *вообще* становится «графическим». Входная точка Dopamine — ровно эта строка:
+
+```objc
+// Application/Dopamine/main.m:59
+return UIApplicationMain(argc, argv, nil, appDelegateClassName);
+```
+
+До `UIApplicationMain` процесс — обычный Unix‑процесс. Внутри `UIApplicationMain` происходит, последовательно: создание singleton `UIApplication`, разбор `UIApplicationSceneManifest` из `Info.plist`, запуск главного run loop, вызов `-application:didFinishLaunchingWithOptions:` у делегата и дальнейшее присоединение сцен. Если твик загружен через `DYLD_INSERT_LIBRARIES` (так Dopamine поступает для системных процессов — подтверждено в `BaseBin/launchdhook/src/spawn_hook.c:192` и `BaseBin/launchdhook/src/main.m` в части `setenv("DYLD_INSERT_LIBRARIES", ...)`) или через `MobileSubstrate`, его constructor выполняется *до* `UIApplicationMain`. Это окно — удобное, но ограниченное: ещё нет ни `UIApplication`, ни сцен, ни окон. Поэтому долго живущая работа внутри constructor — ошибка; разумно подписаться на нотификацию `UIApplicationDidFinishLaunchingNotification` или установить `%hook` на `-[UIApplicationDelegate application:didFinishLaunchingWithOptions:]` и инициализироваться после.
+
+Внутри процесса UIKit выстраивает так называемую *цепочку ответчика* (responder chain). Каждый `UIView` имеет `-nextResponder`, события проходят от самого глубокого view вверх до view controller, до окна, до `UIApplication` и, если никто не обработал, до `UIApplicationDelegate`. Хук на любой уровень этой цепочки работает; выбор уровня определяется зоной ответственности. Пример из Dopamine, где цепочка оборвана намеренно, — `-pointInside:` в `DOModalBackAction`: прозрачный «воротник» вокруг модального диалога пропускает тач, пока он *вне* рамки диалога, но *сам* обрабатывает тап снаружи (см. раздел 6.2.1 ниже).
+
+### 6.1.3. Рендеринг: `CALayer`, `CAAnimation`, QuartzCore, `CADisplayLink`
 
 Над деревом `UIView` живёт параллельное дерево `CALayer` (из `QuartzCore.framework`), и именно его слои отправляются на удалённый композитор — Render Server, работающий в `backboardd` (на iPhone) или сервере композитора на `SpringBoard`. Каждый `UIView` имеет свой `layer`, через который к нему привязаны анимации. В Dopamine это используется явно, когда код в `gfx_reset` снимает ранее поставленные `CABasicAnimation`:
 
@@ -106,7 +153,7 @@ for (UIView *view in button.subviews) {
 }
 ```
 
-Полезная для твиков деталь: `[layer animationForKey:@"..."]` возвращает *копию* анимации, то есть снятие и возврат — операция обратимая. Это удобно, когда во время эксплойта или другой длительной операции нужно временно «заморозить» интерфейс. Ровно это и делает `gfx_reset`. Для автора твика важно другое: любые изменения `UIView` фактически сначала попадают в `CALayer`, затем — в кадровый буфер. Хук на `UIView` (например, подмена цвета фона) переносится в слой только при следующем прохождении runloop‑шага `CA::Transaction::commit()`. Если вы ждёте визуальный эффект сразу — вручную закрепите транзакцию: `+[CATransaction begin]`/`+[CATransaction commit]`.
+Полезная для твиков деталь: `[layer animationForKey:@"..."]` возвращает *копию* анимации, то есть снятие и возврат — операция обратимая. Это удобно, когда во время эксплойта или другой длительной операции нужно временно «заморозить» интерфейс. Ровно это и делает `gfx_reset`. Для автора твика важно другое: любые изменения `UIView` (например, `.backgroundColor`) фактически сначала попадают в `CALayer`, затем — в кадровый буфер. Хук на `UIView` переносится в слой только при следующем прохождении runloop‑шага `CA::Transaction::commit()`. Если вы ждёте визуальный эффект сразу — вручную закрепите транзакцию: `+[CATransaction begin]`/`+[CATransaction commit]`. Для твиков, которым нужна синхронизация с частотой обновления экрана (живой overlay с метриками FPS, например), используется `CADisplayLink` — также из `QuartzCore`; его callback вызывается точно перед композицией следующего кадра.
 
 CoreGraphics в `UIKit`‑контексте играет роль «калькулятора пикселей»: `CGContextRef` используется для оффскрин‑рендера, кастомного `drawRect:` и для операций со `CGImage`. В самом Dopamine CoreGraphics появляется преимущественно вне UIKit — в `BaseBin/libjailbreak/src/display.m` для прямой записи в кадровый буфер через `IOMobileFramebuffer`:
 
@@ -119,7 +166,7 @@ CGContextScaleCTM(context, scale, scale);
 CGContextDrawImage(context, imageRect, cgImage);
 ```
 
-Эта ветка кода уже не UIKit — Dopamine рисует загрузочный логотип напрямую в фреймбуфер, минуя `SpringBoard`/`backboardd`. Для автора UI‑твика это пример того, как «обойти» целиком UIKit‑ и SwiftUI‑стек. На практике такой подход допустим только во время userspace reboot, когда отрисовывающие сервисы заведомо убиты (см. гл. II.5).
+Эта ветка кода уже не UIKit — Dopamine рисует загрузочный логотип напрямую в фреймбуфер, минуя `SpringBoard`/`backboardd`. Для автора UI‑твика это пример того, как «обойти» целиком UIKit‑ и SwiftUI‑стек. На практике такой подход допустим только во время userspace reboot, когда отрисовывающие сервисы заведомо убиты (см. гл. II.5 и явное `killall("/usr/libexec/backboardd", SIGTERM)` в `BaseBin/launchdhook/src/main.m:71`). В штатном приложении запись в `IOMobileFramebuffer` требует entitlement’ов и всё равно будет затёрта следующим кадром Render Server.
 
 ## 6.2. Жесты: три уровня перехвата
 
@@ -128,7 +175,7 @@ CGContextDrawImage(context, imageRect, cgImage);
 | Уровень | Процесс | Основной API | Что видно твику |
 |---|---|---|---|
 | L1. HID | `backboardd` | `IOHIDEvent`, `BKHIDEvent` | Доступ требует injection в `backboardd` и ограничен сущностями, которые разрешает entitlement `com.apple.backboardd.*`. Не подтверждено для твика в произвольном приложении. |
-| L2. Доставка в приложение | `SpringBoard` → приложение | `UIEvent`, `_UIApplicationHandleEventQueue` (private) | Доступно хуком `UIApplication`‑методов, но private selectors не подтверждены исходниками Dopamine. |
+| L2. Доставка в приложение | `SpringBoard` → приложение | `UIEvent`, `-[UIApplication sendEvent:]`, `_UIApplicationHandleEventQueue` (private) | Доступно хуком `-[UIApplication sendEvent:]`. Приватные селекторы не подтверждены исходниками Dopamine. |
 | L3. Распознавание | приложение | `UITouch`, `-touchesBegan:…`, `UIGestureRecognizer` | Публичный API, стабильный и под iOS 26 рекомендуемая цель хука. |
 
 Dopamine сам работает исключительно на L3 — в репозитории нет кода, хукающего `_UIApplicationHandleEventQueue` или классы `IOHIDEvent`. Поиск по репозиторию по строкам `IOHIDEvent`, `_UIApplicationHandleEvent`, `GSEvent`, `shouldSuppressGestureRecognizers` не даёт попаданий — соответствующие точки Dopamine не трогает. Это разумно: приложение само по себе получает только то, что `SpringBoard` ему доставил, и ему незачем лезть ниже L3.
@@ -153,7 +200,7 @@ Dopamine сам работает исключительно на L3 — в ре�
 }
 ```
 
-Разбор: класс `DOModalBackAction` — прозрачное окошко, перехватывающее тап мимо модального диалога, чтобы закрыть его. Переопределение `-pointInside:withEvent:` ограничивает «зону поглощения» — всё, что попало в `self.ignoreFrame`, пропускается ниже. Переопределение `-touchesEnded:withEvent:` на `UIResponder` — самый дешёвый способ отреагировать на тап без создания `UITapGestureRecognizer`. Из этого шаблона важно вынести: `-pointInside:withEvent:` *должен* возвращать `BOOL`, который напрямую управляет цепочкой hit‑test; возвращая `NO`, вы отдаёте событие view, которые находятся *под* вами, но лежат в том же окне.
+Разбор: класс `DOModalBackAction` — прозрачное окошко, перехватывающее тап мимо модального диалога, чтобы закрыть его. Переопределение `-pointInside:withEvent:` ограничивает «зону поглощения» — всё, что попало в `self.ignoreFrame`, пропускается ниже. Переопределение `-touchesEnded:withEvent:` на `UIResponder` — самый дешёвый способ отреагировать на тап без создания `UITapGestureRecognizer`. Из этого шаблона важно вынести: `-pointInside:withEvent:` *должен* возвращать `BOOL`, который напрямую управляет цепочкой hit‑test; возвращая `NO`, вы отдаёте событие view, которые находятся *под* вами, но лежат в том же окне. Hit‑test иерархии (`-[UIView hitTest:withEvent:]`) идёт сверху вниз, но останавливается в первом же поддереве, где `pointInside:` вернул `YES`.
 
 Шаблон второй — псевдо‑кнопка на `UICollectionViewCell` с визуальной обратной связью:
 
@@ -172,7 +219,7 @@ Dopamine сам работает исключительно на L3 — в ре�
 }
 ```
 
-Ключевое — обязательная обработка `touchesCancelled:`. Это тот случай, который начинающие авторы твиков забывают: когда скролл‑контейнер (collection view, scroll view) понимает, что палец ушёл в сторону и это *скролл*, он отменяет текущую цепочку касаний. Если вы не обработали `-touchesCancelled:`, визуальное состояние (например, нажатый `alpha = 0.5`) останется зависшим. Этот баг крайне заметен в твике, который хукает ячейки, но не учитывает отмену.
+Ключевое — обязательная обработка `touchesCancelled:`. Это тот случай, который начинающие авторы твиков забывают: когда скролл‑контейнер (collection view, scroll view) понимает, что палец ушёл в сторону и это *скролл*, он отменяет текущую цепочку касаний через системный `UIPanGestureRecognizer`. Если вы не обработали `-touchesCancelled:`, визуальное состояние (например, нажатый `alpha = 0.5`) останется зависшим. Этот баг крайне заметен в твике, который хукает ячейки, но не учитывает отмену.
 
 Шаблон третий — та же схема плюс `UIImpactFeedbackGenerator` для тактильной отдачи:
 
@@ -200,7 +247,9 @@ Dopamine сам работает исключительно на L3 — в ре�
 Для твиков правило простое:
 
 - Если вы *добавляете новое поведение* к существующему view (длинный тап для контекстного меню, свайп для скрытия) — используйте `UIGestureRecognizer`. Он аккуратно договаривается с остальными жестами через `-requireGestureRecognizerToFail:` и делегат.
-- Если вы *меняете существующее поведение* (хук метода, скрытие нажатия) — хуком идите на тот же уровень, где исходный разработчик это реализовал: если он использовал `-touchesEnded:`, хучьте `-touchesEnded:`; если `UITapGestureRecognizer` — хучьте `-[UITapGestureRecognizer handleTouchesEnded:]` (public селектор не подтверждён — реальный приватный селектор, участвующий в маршрутизации, может называться иначе; требует проверки на устройстве A13 с iOS 26.0/26.0.1).
+- Если вы *меняете существующее поведение* (хук метода, скрытие нажатия) — хуком идите на тот же уровень, где исходный разработчик это реализовал: если он использовал `-touchesEnded:`, хучьте `-touchesEnded:`; если `UITapGestureRecognizer` — хучьте `-[UITapGestureRecognizer handleTouches…]` (точный приватный селектор, участвующий в маршрутизации, может называться иначе; **требует проверки на устройстве A13 с iOS 26.0/26.0.1**).
+
+Полезный приём — *не* подкласс, а делегат. Все системные `UIGestureRecognizer` принимают `UIGestureRecognizerDelegate`. Из твика можно swizzlить `-gestureRecognizerShouldBegin:`, `-gestureRecognizer:shouldReceiveTouch:` или `-gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:` на делегатах нужных контроллеров. Это одновременно наименее инвазивный и наиболее совместимый способ: вы не ломаете чужую логику жеста, а добавляете фильтр.
 
 ### 6.2.3. L1–L2: соотношение с `backboardd`
 
@@ -211,9 +260,19 @@ Dopamine сам работает исключительно на L3 — в ре�
 INSTALL_TARGET_PROCESSES = lsd cfprefsd backboardd runningboardd SpringBoard
 ```
 
-Но *сам факт инъекции* не означает, что Dopamine делает что‑то специфическое с жестами в `backboardd`. Поиск по дереву `BaseBin/roothidehooks/src/` не обнаруживает хуков, работающих с `IOHIDEvent`, HID‑потоком или серверами `backboardd`, принимающими кнопочные комбинации (grep по `IOHIDEvent`, `BKHIDEvent`, `HIDQueue` не находит). То есть практический смысл инъекции в `backboardd` в Dopamine — не вмешиваться в ввод, а соучаствовать в общей инфраструктуре инъекции системных демонов (chg. II.3, II.5).
+Но *сам факт инъекции* не означает, что Dopamine делает что‑то специфическое с жестами в `backboardd`. Поиск по дереву `BaseBin/roothidehooks/src/` не обнаруживает хуков, работающих с `IOHIDEvent`, HID‑потоком или серверами `backboardd`, принимающими кнопочные комбинации (grep по `IOHIDEvent`, `BKHIDEvent`, `HIDQueue` не находит). То есть практический смысл инъекции в `backboardd` в Dopamine — не вмешиваться в ввод, а соучаствовать в общей инфраструктуре инъекции системных демонов (гл. II.3, II.5). Отдельно Dopamine принудительно убивает `backboardd` в фазе userspace reboot:
 
-Для автора твика это означает: *на L1 (`backboardd`) без очень весомой причины лезть не нужно*. Правильно остановиться на L2 или L3. Публично задокументированный способ L2 — переопределить `-[UIApplication sendEvent:]` (один из немногих действительно стабильных приватных «хотспотов»): через него проходит каждое `UIEvent`, доставленное в приложение. Это удобно для глобального аналитического хука (например, записи всех нажатий или блокировки конкретного типа события). Пример применения не найден в Dopamine (это не его задача), поэтому код приводим без ссылки на репозиторий — как общий шаблон:
+```c
+// BaseBin/launchdhook/src/main.m:68-71 (комментарий + вызов)
+// If SpringBoard gets unloaded before backboardd, backboardd will draw a spinning wheel to the framebuffer
+// If this happens after we wrote the boot logo to the framebuffer, it will be replaced by that
+// Therefore, we kill backboardd early so that this race does not happen
+killall("/usr/libexec/backboardd", SIGTERM);
+```
+
+Этот фрагмент важен для понимания слоёв: `backboardd` не только принимает ввод, но и *рисует* промежуточную графику (например, тот самый спиннер) напрямую через `IOMobileFramebuffer`. Поэтому «просто убить backboardd» в живой системе — немедленный чёрный экран; Dopamine делает это только тогда, когда следующий кадр заведомо перекроет свой логотип. Для твика это антипример: отключать `backboardd` в штатном режиме нельзя никогда.
+
+Для автора твика это означает: *на L1 (`backboardd`) без очень весомой причины лезть не нужно*. Правильно остановиться на L2 или L3. Публично задокументированный способ L2 — переопределить `-[UIApplication sendEvent:]` (один из немногих действительно стабильных «хотспотов»): через него проходит каждое `UIEvent`, доставленное в приложение. Это удобно для глобального аналитического хука. Пример применения не найден в Dopamine (это не его задача), поэтому код приводим без ссылки на репозиторий — как общий шаблон:
 
 ```objc
 %hook UIApplication
@@ -228,7 +287,31 @@ INSTALL_TARGET_PROCESSES = lsd cfprefsd backboardd runningboardd SpringBoard
 %end
 ```
 
-Разбор: вызов `%orig` обязателен — любой пропуск приведёт к «мёртвому» UI. Проверка `event.type == UIEventTypeTouches` отсекает жесты от Pencil, remote и клавиатуры (у них отдельные типы). Поскольку `UIEvent` — довольно «тощий» объект, тяжёлая аналитика внутри `-sendEvent:` сломает плавность скролла; выгружайте её в фоновую очередь.
+Разбор: вызов `%orig` обязателен — любой пропуск приведёт к «мёртвому» UI. Проверка `event.type == UIEventTypeTouches` отсекает жесты от Pencil, remote и клавиатуры (у них отдельные типы: `UIEventTypePresses` для аппаратных клавиш, `UIEventTypeMotion` для акселерометра, `UIEventTypeHover` для указателей iPadOS). Поскольку `UIEvent` — довольно «тощий» объект, тяжёлая аналитика внутри `-sendEvent:` сломает плавность скролла; выгружайте её в фоновую очередь.
+
+### 6.2.4. Поток события «снизу вверх»
+
+Небольшая схема, собирающая всё перечисленное:
+
+```mermaid
+sequenceDiagram
+    participant HW as Multi-touch controller
+    participant BB as backboardd (IOHIDEvent)
+    participant SB as SpringBoard (frontmost scene)
+    participant App as App.sendEvent:
+    participant GR as UIGestureRecognizer
+    participant V as UIView.touchesBegan:
+
+    HW->>BB: сырой тач-репорт
+    BB->>SB: BKHIDEvent/IOHIDEvent (XPC)
+    SB->>App: UIEvent через scene session (mach port)
+    App->>App: -[UIApplication sendEvent:]
+    App->>V: hit-test + touchesBegan:
+    App->>GR: распознавание параллельно
+    GR-->>V: при fire — touchesCancelled:
+```
+
+Для твика осмысленные «врезки» на этой диаграмме — только у `App.sendEvent:`, `GR` и `V`. Любая строка выше требует прав, которых у приложения в общем случае нет.
 
 ## 6.3. SwiftUI: почему классический хук здесь работает плохо
 
@@ -242,9 +325,9 @@ SwiftUI — это Swift‑фреймворк, который *не наслед
 - Compile‑time‑known `body: some View` — generic. Его символ в `__TEXT` компилируется с полной мангл‑сигнатурой типа; найти его по имени из C — задача ненулевой сложности и крайне хрупкая от сборки к сборке.
 - Пограничный класс, обёртка `UIHostingController<Content>`, *является* `UIViewController`‑подклассом и доступен селекторами. Но содержимое — generic.
 
-Из этого следует правило: *хукать `body` SwiftUI‑представления не нужно и в общем случае невозможно статически*. То, что действительно можно и нужно хукать — это:
+Из этого следует правило: *хукать `body` SwiftUI‑представления не нужно и в общем случае невозможно статически*. То, что действительно можно и нужно хукать:
 
-1. **Модели данных** (`class`-типы, помеченные `@MainActor` или `ObservableObject`): они являются `NSObject`‑подклассами в большинстве системных сценариев и, следовательно, имеют селекторы. Пограничный класс — именно модель.
+1. **Модели данных** (`class`‑типы, помеченные `@MainActor` или `ObservableObject`): они являются `NSObject`‑подклассами в большинстве системных сценариев и, следовательно, имеют селекторы. Пограничный класс — именно модель.
 2. **Combine `Publisher`'ы и `AnyPublisher`**: сам `Publisher` — generic struct, но часто первоисточник (например, `NotificationCenter.default.publisher(for:)`) опирается на `NSNotificationCenter` — а это полноценный ObjC‑класс. Хук регистрации уведомления работает.
 3. **Границы с UIKit**: `UIHostingController` и, что ещё важнее, системные ячейки вроде `UICollectionViewCell` с хостингом SwiftUI внутри. На этом уровне у вас снова есть селекторы.
 
@@ -256,7 +339,7 @@ flowchart TB
         View[View body]
         Modifier[ViewModifier]
     end
-    subgraph Boundary[Пограничная зона — ObjC-классы]
+    subgraph Boundary[Пограничная зона - ObjC-классы]
         HC[UIHostingController]
         Model[ObservableObject<br/>класс-модель]
         NC[NotificationCenter]
@@ -272,11 +355,9 @@ flowchart TB
     NC --> Model
     HC --> VC
     VC --> Cell
-    classDef red fill:#f99,stroke:#900
-    class Swift red
 ```
 
-На этой схеме красная зона — то, что хуком классическим методом не достать. Голубая и зелёная — то, с чем можно работать: `UIHostingController`, модели, нотификации.
+На этой схеме «Swift» — зона, которую хуком классическим методом не достать. «Boundary» и «UIKit» — то, с чем можно работать: `UIHostingController`, модели, нотификации.
 
 ### 6.3.3. Практический контрпример
 
@@ -290,27 +371,31 @@ flowchart TB
 
 Все эти наблюдения о SwiftUI — концептуальные; в репозитории Dopamine SwiftUI не используется, значит они **не подтверждены исходниками Dopamine**. Проверка на реальных SwiftUI‑компонентах iOS 26 — отдельная задача (**требует проверки на устройстве A13 с iOS 26.0/26.0.1**).
 
+### 6.3.4. Обходной путь: `UIHostingController` как якорь
+
+Единственный надёжно‑стабильный «якорь» в SwiftUI, которого можно коснуться из ObjC, — это `UIHostingController`. Это публичный `UIViewController`‑класс, в чей `init(rootView:)` SwiftUI *обязан* передать свой корневой `View`. Для твика это точка, где вы можете: (а) посмотреть, какой именно hosting controller сейчас на экране (`presentedViewController`, `childViewControllers`); (б) подменить его `-viewDidLoad`, `-viewWillAppear:` и добавить свой `UIView` поверх; (в) swizzlить `-view` чтобы вернуть кастомную обёртку. Это грубо, но *работает*, пока имя класса `UIHostingController` остаётся публичным. Приватный `_UIHostingView` (внутренний `UIView`‑потомок, в который SwiftUI рендерит содержимое) *существует* в UIKitCore iOS 18 — для iOS 26 **не подтверждено исходниками, требует проверки на устройстве A13 с iOS 26.0/26.0.1**.
+
 ## 6.4. Таблица: UIKit‑методы для перехвата и SwiftUI‑альтернативы
 
 Эта таблица обобщает рекомендованные точки хука. Все UIKit‑имена — публичные (из открытых заголовков `UIKit`), все SwiftUI‑стороны обозначены общо и помечены как не подтверждённые.
 
 | Задача | UIKit‑метод для хука | SwiftUI‑альтернатива | Подтверждение |
 |---|---|---|---|
-| Перехват жизненного цикла приложения | `-[UIApplication application:didFinishLaunchingWithOptions:]`, `-[UIApplicationDelegate …]` | `-[UIHostingController viewDidAppear:]`, `-[UIApplicationDelegate …]` (SwiftUI App запускается всё равно через `UIApplicationMain`) | UIKit‑сторона подтверждена `Application/Dopamine/App Delegates/DOAppDelegate.m:17`. SwiftUI — не подтверждено. |
-| Присоединение сцены | `-[<UIWindowSceneDelegate> scene:willConnectToSession:options:]` | `App.body` → `WindowGroup`: границы невидимы ObjC‑рантайму, хук идёт на тот же `UIWindowSceneDelegate`, которым SwiftUI пользуется внутри | UIKit — `Application/Dopamine/App Delegates/DOSceneDelegate.m:17`. SwiftUI — не подтверждено исходниками. |
-| Нажатие на кнопку | `-[UIControl sendAction:to:forEvent:]`, `-[UIButton touchesEnded:withEvent:]` | Хук модели/ViewModel, вызываемой из `.onTapGesture { … }` | UIKit‑сторона — поведение подтверждено наличием таких хуков в типичных твиках; в Dopamine прямого примера нет. SwiftUI — не подтверждено. |
-| Доставка каждого ввода | `-[UIApplication sendEvent:]` | Нет прямого аналога; на SwiftUI тач уходит в UIKit‑хост, то есть хук тот же | Шаблонное знание, в Dopamine не используется. |
-| Переопределение hit‑test | `-[UIView hitTest:withEvent:]`, `-[UIView pointInside:withEvent:]` | То же — SwiftUI рендерит в `UIView` и hit‑test идёт по UIKit‑дереву | `Application/Dopamine/UI/Transition/DOModalBackAction.m:21` |
-| Жесты | `UIGestureRecognizer` подкласс, `-shouldReceiveTouch:`, `-shouldRequireFailureOfGestureRecognizer:` | SwiftUI `Gesture` строится поверх UIGestureRecognizer; хук идёт в UIKit‑обёртку | Не подтверждено исходниками. |
-| Открытие URL | `-[UIApplication openURL:options:completionHandler:]` | То же — SwiftUI `openURL` в конечном счёте вызывает тот же метод | Dopamine: `Application/Dopamine/UI/Settings/DOCreditsViewController.m:38`, `Application/Dopamine/UI/Update/DOUpdateViewController.m:119`, `UI/Settings/Specifiers/DOCreditsCell.m:63` |
-| Нотификации сцены | `UISceneWillEnterForegroundNotification`, `UISceneDidEnterBackgroundNotification` | То же — используются сцены, а не SwiftUI‑API | Dopamine хук не ставит, но каркас виден в `App Delegates/DOSceneDelegate.m:63-73`. |
-| Прокрутка в списках | `-[UIScrollView setContentOffset:]`, `-[UIScrollViewDelegate scrollViewDidScroll:]` | SwiftUI `List`/`ScrollView` рендерятся через `UICollectionView`/`UIScrollView` на уровне UIKit — хук тот же | Шаблонное знание. В Dopamine использование `UIScrollView` присутствует в настройках. |
+| Перехват жизненного цикла приложения | `-[UIApplicationDelegate application:didFinishLaunchingWithOptions:]` | `-[UIHostingController viewDidAppear:]`, `-[UIApplicationDelegate …]` (SwiftUI App запускается через `UIApplicationMain`) | UIKit‑сторона: `Application/Dopamine/App Delegates/DOAppDelegate.m:17`. SwiftUI — не подтверждено. |
+| Присоединение сцены | `-[<UIWindowSceneDelegate> scene:willConnectToSession:options:]` | `App.body` → `WindowGroup` — хук идёт на тот же `UIWindowSceneDelegate` | UIKit: `Application/Dopamine/App Delegates/DOSceneDelegate.m:17`. SwiftUI — не подтверждено. |
+| Нажатие на кнопку | `-[UIControl sendAction:to:forEvent:]`, `-[UIButton touchesEnded:withEvent:]` | Хук модели/ViewModel, вызываемой из `.onTapGesture { … }` | Шаблонное знание; в Dopamine прямого примера нет. SwiftUI — не подтверждено. |
+| Доставка каждого ввода | `-[UIApplication sendEvent:]` | Нет прямого аналога; тач уходит в UIKit‑хост, хук тот же | Шаблонное знание, в Dopamine не используется. |
+| Переопределение hit‑test | `-[UIView hitTest:withEvent:]`, `-[UIView pointInside:withEvent:]` | SwiftUI рендерит в `UIView`, hit‑test идёт по UIKit‑дереву | `Application/Dopamine/UI/Transition/DOModalBackAction.m:21` |
+| Жесты | `UIGestureRecognizer`‑подкласс, `-shouldReceiveTouch:` | SwiftUI `Gesture` строится поверх UIGestureRecognizer | Не подтверждено исходниками. |
+| Открытие URL | `-[UIApplication openURL:options:completionHandler:]` | SwiftUI `openURL` в конечном счёте вызывает тот же метод | Dopamine: `UI/Settings/DOCreditsViewController.m:38`, `UI/Update/DOUpdateViewController.m:119`, `UI/Settings/Specifiers/DOCreditsCell.m:63` |
+| Нотификации сцены | `UISceneWillEnterForegroundNotification` и т. п. | То же, используются сцены | Каркас: `App Delegates/DOSceneDelegate.m:63-73`. |
+| Прокрутка в списках | `-[UIScrollView setContentOffset:]`, `-[UIScrollViewDelegate scrollViewDidScroll:]` | SwiftUI `List`/`ScrollView` рендерятся через `UICollectionView`/`UIScrollView` | Шаблонное знание. |
 
 ### 6.4.1. Как читать эту таблицу
 
-Главный вывод из неё — *в большинстве случаев SwiftUI‑альтернативы отсутствуют не потому, что их нет, а потому что SwiftUI рендерится через UIKit‑примитивы.* Это значит, что ваш твик должен ориентироваться на UIKit‑метод, который SwiftUI в итоге дёрнет. Это, в свою очередь, означает две неприятности:
+Главный вывод из неё — *в большинстве случаев SwiftUI‑альтернативы отсутствуют не потому, что их нет, а потому что SwiftUI рендерится через UIKit‑примитивы.* Это значит, что ваш твик должен ориентироваться на UIKit‑метод, который SwiftUI в итоге дёрнет. Из этого следуют две неприятности:
 
-1. Имена private UIKit‑классов, которые SwiftUI использует для хостинга (`_UIHostingView`, `_UIHostingViewController`, именования `_TtGC7SwiftUI19UIHostingController…`), могут меняться от версии к версии. Прямое указание имени через `NSClassFromString(@"_UIHostingView")` работает, но требует проверки на целевой iOS. Для iOS 26 — **не подтверждено исходниками Dopamine; требует проверки на устройстве**.
+1. Имена private UIKit‑классов, которые SwiftUI использует для хостинга (`_UIHostingView`, именования `_TtGC7SwiftUI19UIHostingController…`), могут меняться от версии к версии. Прямое указание имени через `NSClassFromString(@"_UIHostingView")` работает, но требует проверки на целевой iOS. Для iOS 26 — **не подтверждено исходниками Dopamine; требует проверки на устройстве**.
 2. Любые модификаторы SwiftUI, которые внешне выглядят как «моё поведение» (например, `.onLongPressGesture`), под капотом создают `UILongPressGestureRecognizer`. Хук на `UILongPressGestureRecognizer`‑класс в целом (а не на конкретный инстанс в вашем View) *сработает глобально* — и это, скорее всего, не то, что вы хотите. Правильно — через делегат жеста или через фильтр по `view` в самом обработчике.
 
 ## 6.5. Практические наблюдения и чеклист
@@ -339,11 +424,11 @@ flowchart TB
 
 ### 6.5.2. Различия iOS 26.0 vs 26.0.1 в этой области
 
-В исходниках Dopamine (ветка roothide 3.0.12, рассматриваемая в книге) различий между 26.0 и 26.0.1 в коде, затрагивающем UIKit, сцены, жесты и SwiftUI, не выявлено. Контурно поддерживаемые билды (23B5059e для 26.0.1 Developer Beta и 23B5064e для 26.0.1 Release) закреплены в plist эксплойтов (`Application/Dopamine/Exploits/DarkSword/Info.plist`, `Application/Dopamine/Exploits/ClearSword/Info.plist`); слои UIKit и сцена ведут себя одинаково в обеих версиях — различий в этом месте проекта не выявлено.
+В исходниках Dopamine (ветка roothide 3.0.12, рассматриваемая в книге) различий между 26.0 и 26.0.1 в коде, затрагивающем UIKit, сцены, жесты и SwiftUI, не выявлено. Контурно поддерживаемые билды (23B5059e для 26.0.1 Developer Beta и 23B5064e для 26.0.1 Release) закреплены в plist эксплойтов (`Application/Dopamine/Exploits/DarkSword/Info.plist`, `Application/Dopamine/Exploits/ClearSword/Info.plist`); слои UIKit и сцена ведут себя одинаково в обеих версиях — различий между 26.0 и 26.0.1 в этом месте проекта не выявлено.
 
 ## Выводы
 
-На уровне кода, который действительно важен автору твика под iOS 26 для A13, UIKit остался основным «клеем» всего пользовательского интерфейса. SwiftUI поверх UIKit — реальность, но границы хуков совпадают с границами UIKit‑примитивов: сцена, окно, hostig‑контроллер, `UIGestureRecognizer`, `UITouch`. Всё, что лежит выше (сам Swift‑struct `View`), для классического рантайм‑хука почти недоступно; всё, что лежит ниже (HID в `backboardd`), Dopamine сам не трогает и трогать не просит.
+На уровне кода, который действительно важен автору твика под iOS 26 для A13, UIKit остался основным «клеем» всего пользовательского интерфейса. SwiftUI поверх UIKit — реальность, но границы хуков совпадают с границами UIKit‑примитивов: сцена, окно, hosting‑контроллер, `UIGestureRecognizer`, `UITouch`. Всё, что лежит выше (сам Swift‑struct `View`), для классического рантайм‑хука почти недоступно; всё, что лежит ниже (HID в `backboardd`), Dopamine сам не трогает и трогать не просит.
 
 Три правила, которые читатель должен унести из главы:
 

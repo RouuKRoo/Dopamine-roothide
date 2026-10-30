@@ -574,7 +574,7 @@ int boomerang_get_physrw(audit_token_t *clientToken, bool singlePTE, uint64_t *s
 
 Разбор ключевых строк:
 - `audit_token_to_pid(*clientToken)` — выдаёт pid клиента на основе проверенного ядром audit-token. Это критично: не доверяем `getpid()` из тела запроса, иначе любой процесс мог бы запросить handoff в чужой pmap.
-- `thread_caffeinate_start/stop` — защита от ухода CPU в idle в середине операции (ядерные PTE-писания плохо совмещаются с заморозкой cluster'а). Это бест-эффорт, но важный.
+- `thread_caffeinate_start/stop` — защита от ухода CPU в idle в середине операции. Бест-эффорт, но важный.
 - Для PTE-ветки `singlePTEAsidPtr` — выходной параметр. Он возвращает клиенту адрес (в клиентском userspace), по которому у клиента окажется mapping страницы pmap с полем ASID — это нужно, чтобы на стороне клиента работал `flush_tlb()`.
 
 ### 6a.2 Клиентская часть
@@ -597,7 +597,7 @@ if (jbclient_root_get_physrw(physrwPTE, &asidPtr) == 0) {
 
 Флаг `receivedHandoff = true` в обоих `_init` означает: «мои PTE уже прошиты сервером, мне не нужно звать `pmap_map_in` или `pmap_expand_range` в своём адресном пространстве, достаточно только зарегистрировать функции в `gPrimitives`». В `physrw_pte.c:200-213` эта ветка просто сохраняет `gAsid = (void *)asidPtr` и выставляет три указателя-functor'а.
 
-Важный нюанс (подтверждено исходниками, `physrw_pte.c:188-190`): `flush_tlb()` в handoff зовётся только, если `getpid() == pid`. Для чужого процесса сервер этого сделать не может — его собственный TLB-flush не влияет на клиента. Поэтому клиент при первом же `acquire_window` увидит TLB-stale на индексе 0 и 1 (но мы в них не пишем после handoff — ok), а также на любом индексе, которым он ещё не пользовался (там пусто, flush не нужен). На практике это работает, потому что на старте все записи кроме [0] и [1] — нули, а на нулях `(pte & ARM_TTE_PA_MASK) == 0` для любого ненулевого запрошенного `pa`, значит в find-existing не ложное совпадение.
+Важный нюанс (подтверждено исходниками, `physrw_pte.c:188-190`): `flush_tlb()` в handoff зовётся только, если `getpid() == pid`. Для чужого процесса сервер этого сделать не может — его собственный TLB-flush не влияет на клиента. Поэтому клиент при первом же `acquire_window` увидит TLB-stale на индексе 0 и 1 (но мы в них не пишем после handoff — ok), а также на любом индексе, которым он ещё не пользовался (там пусто, flush не нужен).
 
 ### 6a.3 Безопасность handoff
 
@@ -611,9 +611,9 @@ if (jbclient_root_get_physrw(physrwPTE, &asidPtr) == 0) {
 
 Ответ — в последовательности из `dopamine/src/main.m:60-85` (это standalone-дроппер корневого процесса) и `DOJailbreaker.m:220-243` (это основной путь из UI):
 
-1. Эксплойт (PPL-bypass через DarkSword/ClearSword на A12/A13 по iOS 26) сначала устанавливает **свои собственные** `physreadbuf`/`physwritebuf` в `gPrimitives`. Этот первичный примитив медленный и привязан к состоянию эксплойта. В репозитории он живёт в `BaseBin/libjailbreak/src/corellium_krw.*` для Corellium-пути, а для реального устройства — в коде соответствующего эксплойта (не разбирается здесь — тема части главы про PPL-exploit).
+1. Эксплойт (PPL-bypass через DarkSword/ClearSword на A12/A13 по iOS 26) сначала устанавливает **свои собственные** `physreadbuf`/`physwritebuf` в `gPrimitives`. Этот первичный примитив медленный и привязан к состоянию эксплойта.
 2. Вызывается `libjailbreak_translation_init()` (`translation.c:134`), которая настраивает `arm_tt_level[0..3]` и ставит `gPrimitives.phystokv`, `gPrimitives.vtophys`.
-3. Теперь `vtophys_lvl` может работать (он использует `physread64` поверх эксплойта), `kreadbuf` работает через `_kreadbuf_phys`, `physwritebuf` работает — все три вызываются внутри `physrw_pte_handoff`.
+3. Теперь `vtophys_lvl` может работать (использует `physread64` поверх эксплойта), `kreadbuf` работает через `_kreadbuf_phys`, `physwritebuf` работает — все три вызываются внутри `physrw_pte_handoff`.
 4. Хэндовер прошил magic-PT и ASID-страницу в userspace. С этого момента `libjailbreak_physrw_pte_init(false, 0)` перезаписывает `gPrimitives.physreadbuf/physwritebuf/physaccess_mapped` на свои (быстрые, не завязанные на эксплойт).
 5. Эксплойт теперь можно свернуть (`cleanUpExploits` в `DOJailbreaker.m:245`), потому что `gPrimitives` указывает уже не на него.
 
@@ -623,21 +623,21 @@ if (jbclient_root_get_physrw(physrwPTE, &asidPtr) == 0) {
 
 ```mermaid
 sequenceDiagram
-    participant E as Exploit (PPL-bypass)
+    participant E as Exploit
     participant G as gPrimitives
     participant T as translation
     participant H as physrw_pte_handoff
     participant K as Kernel pmap
 
-    E->>G: physreadbuf = exploit_read<br/>physwritebuf = exploit_write
+    E->>G: physreadbuf=exploit_read, physwritebuf=exploit_write
     T->>G: phystokv/vtophys готовы
-    H->>G: вызывает kread/physwrite (через exploit)
-    H->>K: pmap_expand_range (строит L3)
+    H->>G: kread/physwrite через exploit
+    H->>K: pmap_expand_range строит L3
     H->>K: physwrite64 magic-PT self-ref
     H->>K: physwrite64 ASID-страница mapping
-    H->>H: flush_tlb() на себе
-    Note over G: libjailbreak_physrw_pte_init<br/>перезаписывает physreadbuf/writebuf<br/>на physrw_pte_*
-    E->>E: cleanup (unloaded)
+    H->>H: flush_tlb на себе
+    Note over G: libjailbreak_physrw_pte_init перезаписывает<br/>physreadbuf/writebuf на physrw_pte_*
+    E->>E: cleanup
 ```
 
 ---
@@ -650,7 +650,7 @@ sequenceDiagram
 
 С точки зрения оборудования, L3-таблица — это обычная 16-КиБ физическая страница. Она становится «таблицей» только через ссылку из вышестоящего уровня: конкретная L2 PTE говорит «тут не блок, тут таблица, адрес такой» (`ARM_TTE_TYPE_TABLE = 0x2`, `pte.h:55`). Если ту же физстраницу прошить **как блок данных** через *другую* L3 PTE в этой же (или другой) таблице, MMU не возразит: обе цепочки трансляции независимы.
 
-Это и есть основа self-mapping. Нулевая запись `gMagicPT[0]` — L3 PTE со значением `magicPT | ... | PTE_LEVEL3_ENTRY`. MMU, пройдя VA `MAGIC_PT_ADDRESS + 0` → L1 → L2 → L3[0], получает PA той же страницы, в которой лежит сама L3-таблица. userspace читает/пишет её как обычные байты.
+Это и есть основа self-mapping. Нулевая запись `gMagicPT[0]` — L3 PTE со значением `magicPT | ... | PTE_LEVEL3_ENTRY`. MMU, пройдя VA `MAGIC_PT_ADDRESS + 0` → L1 → L2 → L3[0], получает PA той же страницы, в которой лежит сама L3-таблица. Userspace читает/пишет её как обычные байты.
 
 ### 6c.2 Почему именно `0x5000000000`
 
@@ -672,7 +672,7 @@ TLB-flush | не нужен в рантайме | при замене валид
 Mutex | не нужен | `gLock` на всю таблицу
 Производительность physread64 | один memcpy 8 байт | mutex + поиск + memcpy
 Безопасность | все ядерные секреты в userspace | только одна страница зараз
-Поддерживается на A12/A13 iOS 26.0/26.0.1 | да, как фолбек, выбирается только когда `device_supports_physrw_pte()==false` (а это только A8/A8X) | **да, выбирается по умолчанию** на A12/A13
+Поддерживается на A12/A13 iOS 26.0/26.0.1 | да, как фолбек, только когда `device_supports_physrw_pte()==false` (т. е. только A8/A8X) | **да, выбирается по умолчанию** на A12/A13
 Поддерживается на A8/A8X | да | нет — вызывает «unexplainable watchdog resets», комментарий `physrw_pte.c:221-227`
 
 ---
@@ -726,13 +726,111 @@ for (uint64_t va = l2Start; va < l2End; va += L2_BLOCK_SIZE) {
 
 ---
 
+## 6e. Барьеры памяти, порядок, кеши
+
+Все три реализации (`physrw_physreadbuf`, `physrw_physwritebuf`, `physrw_pte_physreadbuf/writebuf`) обёрнуты `__asm("dmb sy")`. Разберём, почему и когда это обязательно.
+
+`DMB SY` — Data Memory Barrier, full system. Он гарантирует, что все обращения к памяти **до** барьера станут видны **наблюдателям** раньше, чем все обращения **после**. Для нас наблюдатели — ядерные пути исполнения, которые читают/пишут те же физические адреса (через свой kernel VA или напрямую). Без барьера:
+
+- CPU может переупорядочить `memcpy(uaddr, input, size)` относительно последующих действий, и ядро, прочитав kaddr, увидит частично обновлённые данные.
+- На ARMv8 ядрах A12/A13 (big.LITTLE Lightning + Thunder) межъядерное наблюдение памяти **не TSO** — пишущий поток и наблюдатель на другом ядре могут видеть записи в разном порядке без явного барьера.
+- Кэши L1/L2 между P-ядрами и E-ядрами когерентны аппаратно для нормальной (cacheable) памяти, но порядок видимости записей — нет. `DMB SY` упорядочивает их.
+
+Для `physrw_pte` между записью PTE и доступом по новому VA необходимо не только `DMB SY`, но и TLB-flush — иначе MMU продолжит переводить VA по кешу TLB. Разница:
+
+- `DMB SY` — упорядочивает **данные**.
+- `TLBI` (в userspace недоступен прямо, Dopamine делает его через `pmap->sw_asid`-трюк) — очищает **трансляцию**.
+- Для добавления новой PTE в пустой слот (не замены валидной) TLB-flush формально не нужен — там и так не было mapping, значит в TLB и нет записи для сброса. Dopamine это учитывает: ветка «нашли пустую» в `acquire_window` TLB не трогает.
+
+Инструкции кэша (`DC CIVAC`, `IC IVAU`) **не** вызываются из userspace — они обрабатываются ядром при необходимости. Для patch-points, которые требуют I-cache invalidation (TrustCache-патчи, подпись code pages), в Dopamine есть отдельная логика через вспомогательные kcall-гаджеты — не разбирается здесь.
+
+### enumerate_pages: алгоритм выравнивания
+
+`primitives.c:15-27`:
+
+```c
+void enumerate_pages(uint64_t start, size_t size, uint64_t pageSize, bool (^block)(uint64_t curStart, size_t curSize))
+{
+    uint64_t curStart = start;
+    size_t sizeLeft = size;
+    bool c = true;
+    while (sizeLeft > 0 && c) {
+        uint64_t pageOffset = curStart & (pageSize - 1);
+        uint64_t readSize = min(sizeLeft, pageSize - pageOffset);
+        c = block(curStart, readSize);
+        curStart += readSize;
+        sizeLeft -= readSize;
+    }
+}
+```
+
+На каждой итерации `pageOffset` — это смещение *текущего* `curStart` внутри его страницы, а `readSize` — минимум от «сколько осталось всего» и «сколько осталось до конца страницы». Это даёт правильное дробление запроса на выравнивание первой/последней страницы:
+
+- Если `start` выровнен — первая итерация делает полную страницу.
+- Если `start` смещён на 100 байт внутри страницы — первая итерация делает `pageSize - 100` байт, после чего `curStart` выровнен, и дальше идут полные страницы.
+- Последняя итерация делает хвост.
+
+Этот алгоритм — предпосылка того, что `acquire_window` всегда получает выровненный `pa` (`curPA & ~vm_real_kernel_page_mask`), а добавка `curPA & vm_real_kernel_page_mask` даёт offset внутри страницы.
+
+---
+
+## 6f. Каталог ошибок
+
+Таблица для разработчика, который видит ненулевой код возврата и хочет понять, где именно он споткнулся.
+
+Код | Источник | Смысл
+---|---|---
+`-1` в `physrw_pte_physaccess_mapped` | проверка границы | Доступ пересекает границу 16 KiB — используйте `kreadbuf`/`kwritebuf`
+`-1` в `physrw_handoff` | нулевой pid | Неправильный вход
+`-2` | `physrw_handoff` | `proc_find` вернул NULL
+`-3` | `physrw_*_handoff` | `proc_task` вернул NULL
+`-4` | то же | `task->map` = NULL
+`-5` | то же | `vm_map->pmap` = NULL
+`-6` | `physrw_pte_handoff` | `pmap_expand_range` не смог аллоцировать таблицы
+`-7` | `physrw_pte_handoff` | `vtophys_lvl` вернул 0 для `MAGIC_PT_ADDRESS` после expand_range (странно)
+`-10 + mapInRet` | `physrw_handoff` | ошибка `pmap_map_in` (`util.c:538`)
+`errno=1030` | `physrw_phystouaddr` | PA вне диапазона `[physBase, physBase+physSize)`
+`errno=1041` | `vtophys_lvl` | leaf level > L3 (баг входа)
+`errno=1042` | `vtophys_lvl` | TTE невалиден (validMask bits не выставлены)
+`errno=1043` | `vtophys_lvl` | нет функции для чтения TTE
+
+Все коды подтверждены исходниками: `physrw.c:20,96`, `physrw_pte.c:152-187`, `translation.c:75-98`.
+
+---
+
+## 6g. Что должен сделать патчер, если собрался менять physrw
+
+Этот раздел — для автора части книги про патчи. Если вы пишете патч ядра, который *сам* будет работать с памятью напрямую (не через libjailbreak):
+
+1. **Не выдумывать PTE-биты.** На A12/A13 `PERM_KRW_URW == 0x7`, который `PERM_TO_PTE` разворачивает в AP[2:1] + PXN + UXN (`pte.h:23-25`). Если нужны другие права — реверсните по тому же шаблону. Не искать «правильные биты в документации Apple», доверять `PERM_TO_PTE`.
+2. **`ARM_TTE_PA_MASK = 0x0000fffffffff000`.** На A12/A13 этого достаточно; будущие SoC могут потребовать расширения.
+3. **TLB-flush обязателен при замене валидной PTE.** Если пропустите, mapping уйдёт в inconsistent state, и kernel panic случится через случайное время — отладка будет мучительной.
+4. **`PTE_NON_GLOBAL`** в наших PTE — чтобы TLB-flush через ASID сработал. Если забыть этот бит и поставить глобальную запись, flush по ASID не поможет.
+5. **Mutex обязателен.** `gLock` в `physrw_pte.c:14` защищает `gMagicPT` целиком. Иначе гонка.
+6. **На A8/A8X** `physrw_pte` **не используется** — `device_supports_physrw_pte()` возвращает `false` для `CPUFAMILY_ARM_TYPHOON`. Если ваш патч должен работать и там, используйте API `physread/physwrite` без прямого доступа к `gMagicPT`.
+7. **Не кэшируйте указатель-результат `physaccess_mapped`.** Он валиден только пока вы внутри блока; за пределами `acquire_window` окно может быть переиспользовано под другую страницу.
+
+---
+
+## 6h. Что оставлено за кадром
+
+Эта глава не разбирает:
+
+- **IOSurface-primitives** (`primitives_IOSurface.m`) — альтернативная реализация `kreadbuf` на основе bagged IOSurface properties, устанавливает `krwMinSafeReadSize` в `gPrimitives`. Инициализируется параллельно в `jbclient_initialize_primitives_internal`.
+- **Fugu14-kcall** и `kptr_sign` — тема следующей главы.
+- **vreadbuf/vwritebuf, proc_vreadbuf/proc_vwritebuf** (`primitives.c:151-205`) — чтение/запись в чужое userspace процесса через его pmap. Строятся поверх physrw.
+- **TXM** (Trusted eXecution Monitor) — для SPTM-девайсов (не наш A12/A13 на iOS 26).
+- **Как именно эксплойт предоставляет первичный physwrite** — тема части про PPL-bypass (DarkSword/ClearSword).
+
+---
+
 ## 7. Чеклист воспроизводимости
 
 Прежде чем ставить эксперименты на устройстве:
 
 1. Собрать `BaseBin/libjailbreak` с debug-print в `acquire_window`, посмотреть индекс и `pa` при каждом вызове. Это даёт понимание, как часто вы заполняете L3 и когда срабатывает полный flush.
 2. Для оффсетов `koffsetof(pmap, ttep)`, `koffsetof(pmap, sw_asid)/asid`, `koffsetof(task, map)`, `koffsetof(vm_map, pmap)` в целевом ядре 26.0 и 26.0.1 — прогнать grep по `jbinfo` сборке и/или сравнить с публичным XNU `osfmk/arm/pmap.h` ветки, соответствующей билду. Эта глава не фиксирует их значения — они зависят от сборки.
-3. На A13 на iOS 26.0.1 проверить, что `kconstant(physBase)` при чтении `vtophys_lvl` c `leafLevel=L2` сразу после `pmap_expand_range` действительно возвращает физкадр L3-таблицы, а не TTE пути ниже. Это central assumption physrw_pte_handoff.
+3. На A13 на iOS 26.0.1 проверить, что `kconstant(physBase)` при чтении `vtophys_lvl` с `leafLevel=L2` сразу после `pmap_expand_range` действительно возвращает физкадр L3-таблицы, а не TTE пути ниже. Это central assumption `physrw_pte_handoff`.
 4. Проверить, что TLB-flush через ASID даёт корректное поведение (запись в i-ю PTE становится видна после `usleep(0)`). Для 27 это уже не так — переключение на фолбек даёт +160 мкс на каждое acquire_window.
 
 ---
@@ -747,7 +845,7 @@ for (uint64_t va = l2Start; va < l2End; va += L2_BLOCK_SIZE) {
 - API `kalloc_pt`, `physical_write_64`, `kread_virtual` в roothide-репозитории **не найдены** по grep — не надо на них ссылаться. Эквивалентные вещи называются `pmap_alloc_page_table`, `physwrite64`, `kread64`/`_kreadbuf_phys`.
 - Для 26.0 vs 26.0.1 различия в этой подсистеме **не выявлены** — путь выполнения тот же.
 
-Непроверенные/требующие стенда моменты (ещё раз, явно):
+Непроверенные/требующие стенда моменты (явно):
 1. Конкретные `koffsetof(pmap, *)` для сборки 26.0/26.0.1 — брать из `jbinfo` или ревизии XNU.
 2. Поведение TLB-flush через ASID на 26.0.1 — комментарий кода указывает проблему на 27, но не на 26. По коду 26 работает штатным путём; требует проверки на устройстве.
 3. Значения `kconstant(physBase)`, `physSize` для конкретного SoC — не захардкожены и приходят из рантайм-инициализации.
@@ -756,7 +854,7 @@ for (uint64_t va = l2Start; va < l2End; va += L2_BLOCK_SIZE) {
 
 ## 9. Что дальше
 
-Следующая глава логически — kernel-call-аппарат на arm64e: как Dopamine обходит PAC через Fugu14-kcall-гаджет и каким образом он опирается на уже работающий physrw. Там же обсуждается, какие soltы PAC используются для каких ptr-полей и как `kwrite_ptr` (`primitives.c:324`) ведёт себя при `host_is_arm64e()`.
+Следующая глава логически — kernel-call-аппарат на arm64e: как Dopamine обходит PAC через Fugu14-kcall-гаджет и каким образом он опирается на уже работающий physrw. Там же обсуждается, какие соли PAC используются для каких ptr-полей и как `kwrite_ptr` (`primitives.c:324`) ведёт себя при `host_is_arm64e()`.
 
 Параллельно стоит прочитать:
 - `BaseBin/libjailbreak/src/util.c:538-609` — внутренности `pmap_map_in_with_flags`, то, что `physrw_handoff` вызывает «за кулисами».
